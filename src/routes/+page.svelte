@@ -1,647 +1,741 @@
 <script>
 	import { onMount, tick } from 'svelte';
-	import { specToMarkdown } from '$lib/specToMarkdown.js';
+	import { goto } from '$app/navigation';
+	import icon from '$lib/assets/icon.svg';
 	import { loadState, saveState, newSession, newSessionId } from '$lib/storage.js';
 
-	let sessions = $state({});
-	let activeId = $state(null);
-	let input = $state('');
+	let idea = $state('');
 	let loading = $state(false);
-	let errorMsg = $state('');
-	let chatEl;
-	let hydrated = $state(false);
+	let sessions = $state({});
+	let textareaEl;
+	let pendingDeleteId = $state(null);
+	let confirmTimer;
+	let clearAllPending = $state(false);
+	let clearAllTimer;
 
-	const active = $derived(activeId ? sessions[activeId] : null);
-	const messages = $derived(active?.messages ?? []);
-	const spec = $derived(active?.spec ?? null);
-	const sessionList = $derived(
-		Object.values(sessions).sort((a, b) => b.updatedAt - a.updatedAt)
+	const examples = [
+		'focus timer that blocks distracting sites',
+		'meal planner from fridge photos',
+		'reading app that summarises PDFs'
+	];
+
+	const fileList = $derived(
+		Object.values(sessions)
+			.filter((s) => s?.messages?.length)
+			.sort((a, b) => b.updatedAt - a.updatedAt)
 	);
 
-	onMount(() => {
-		const s = loadState();
-		sessions = s.sessions;
-		activeId = s.activeId;
-		if (!activeId || !sessions[activeId]) {
-			startNewSession();
-		}
-		hydrated = true;
+	onMount(async () => {
+		const state = loadState();
+		sessions = state.sessions || {};
+		await tick();
+		textareaEl?.focus();
 	});
 
-	$effect(() => {
-		if (!hydrated) return;
-		saveState({ sessions, activeId });
-	});
+	function useExample(text) {
+		idea = text;
+		textareaEl?.focus();
+	}
 
-	function startNewSession() {
+	async function start() {
+		const text = idea.trim();
+		if (!text || loading) return;
+		loading = true;
+
 		const id = newSessionId();
-		sessions = { ...sessions, [id]: newSession(id) };
-		activeId = id;
-		input = '';
-		errorMsg = '';
+		const session = newSession(id);
+		session.messages = [{ role: 'user', content: text }];
+		session.title = text.slice(0, 60) + (text.length > 60 ? '...' : '');
+		session.updatedAt = Date.now();
+
+		const nextSessions = { ...sessions, [id]: session };
+		saveState({ sessions: nextSessions, activeId: id });
+
+		await goto('/app');
 	}
 
-	function selectSession(id) {
-		activeId = id;
-		errorMsg = '';
+	function openSession(id) {
+		if (!sessions[id]) return;
+		if (pendingDeleteId) return;
+		saveState({ sessions, activeId: id });
+		goto('/app');
 	}
 
-	function deleteSession(id) {
+	function requestDelete(id, e) {
+		e?.stopPropagation();
+		clearAllPending = false;
+		if (pendingDeleteId === id) {
+			confirmDelete(id);
+			return;
+		}
+		pendingDeleteId = id;
+		clearTimeout(confirmTimer);
+		confirmTimer = setTimeout(() => (pendingDeleteId = null), 2800);
+	}
+
+	function confirmDelete(id) {
 		const next = { ...sessions };
 		delete next[id];
 		sessions = next;
-		if (activeId === id) {
-			const remaining = Object.values(sessions).sort((a, b) => b.updatedAt - a.updatedAt);
-			if (remaining.length) activeId = remaining[0].id;
-			else startNewSession();
+		saveState({ sessions, activeId: null });
+		pendingDeleteId = null;
+		clearTimeout(confirmTimer);
+	}
+
+	function cancelPending(e) {
+		if (pendingDeleteId && !e.target.closest?.('[data-delete-btn]')) {
+			pendingDeleteId = null;
+			clearTimeout(confirmTimer);
+		}
+		if (clearAllPending && !e.target.closest?.('[data-clear-all]')) {
+			clearAllPending = false;
+			clearTimeout(clearAllTimer);
 		}
 	}
 
-	function updateActive(patch) {
-		if (!activeId) return;
-		const current = sessions[activeId];
-		sessions = {
-			...sessions,
-			[activeId]: { ...current, ...patch, updatedAt: Date.now() }
-		};
-	}
-
-	async function send() {
-		const text = input.trim();
-		if (!text || loading || !active) return;
-
-		errorMsg = '';
-		const userMsg = { role: 'user', content: text };
-		const nextMessages = [...messages, userMsg];
-		const titleFromFirst =
-			active.messages.length === 0
-				? text.slice(0, 60) + (text.length > 60 ? '…' : '')
-				: active.title;
-
-		updateActive({ messages: nextMessages, title: titleFromFirst });
-		input = '';
-		loading = true;
-		await tick();
-		scrollChat();
-
-		try {
-			const res = await fetch('/api/chat', {
-				method: 'POST',
-				headers: { 'content-type': 'application/json' },
-				body: JSON.stringify({ messages: nextMessages, currentSpec: spec })
-			});
-			if (!res.ok) {
-				const text = await res.text();
-				throw new Error(text || `Request failed (${res.status})`);
-			}
-			const data = await res.json();
-			const assistantMsg = { role: 'assistant', content: data.reply };
-			updateActive({
-				messages: [...nextMessages, assistantMsg],
-				spec: data.spec,
-				title:
-					data.spec?.title && active.messages.length === 0 ? data.spec.title : titleFromFirst
-			});
-		} catch (e) {
-			errorMsg = e?.message || 'Something went wrong';
-		} finally {
-			loading = false;
-			await tick();
-			scrollChat();
+	function requestClearAll() {
+		if (clearAllPending) {
+			sessions = {};
+			saveState({ sessions: {}, activeId: null });
+			clearAllPending = false;
+			clearTimeout(clearAllTimer);
+			return;
 		}
-	}
-
-	function scrollChat() {
-		if (chatEl) chatEl.scrollTop = chatEl.scrollHeight;
+		clearAllPending = true;
+		clearTimeout(clearAllTimer);
+		clearAllTimer = setTimeout(() => (clearAllPending = false), 2800);
 	}
 
 	function onKeydown(e) {
-		if (e.key === 'Enter' && !e.shiftKey) {
+		if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
 			e.preventDefault();
-			send();
+			start();
 		}
 	}
 
-	function exportMarkdown() {
-		if (!spec) return;
-		const md = specToMarkdown(spec);
-		const blob = new Blob([md], { type: 'text/markdown' });
-		const url = URL.createObjectURL(blob);
-		const a = document.createElement('a');
-		const safe = (spec.title || 'spec').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
-		a.href = url;
-		a.download = (safe || 'spec') + '.md';
-		document.body.appendChild(a);
-		a.click();
-		a.remove();
-		URL.revokeObjectURL(url);
-	}
-
-	async function copyMarkdown() {
-		if (!spec) return;
-		const md = specToMarkdown(spec);
-		try {
-			await navigator.clipboard.writeText(md);
-		} catch {
-			// ignore
-		}
+	function rel(ts) {
+		const diff = Math.max(0, Date.now() - ts);
+		if (diff < 60_000) return 'now';
+		if (diff < 3600_000) return Math.floor(diff / 60_000) + 'm';
+		if (diff < 86400_000) return Math.floor(diff / 3600_000) + 'h';
+		if (diff < 30 * 86400_000) return Math.floor(diff / 86400_000) + 'd';
+		return new Date(ts).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
 	}
 </script>
 
 <svelte:head>
-	<title>Write My App — Spec generator</title>
+	<title>write my app</title>
 </svelte:head>
 
-<div class="app">
-	<aside class="sidebar">
-		<button class="primary" onclick={startNewSession}>+ New session</button>
-		<div class="session-list">
-			{#each sessionList as s (s.id)}
-				<div class="session-row" class:active={s.id === activeId}>
-					<button class="session-pick" onclick={() => selectSession(s.id)}>
-						<div class="session-title">{s.title}</div>
-						<div class="session-sub">
-							{s.messages.length} msg · {new Date(s.updatedAt).toLocaleDateString()}
-						</div>
+<svelte:window on:click={cancelPending} />
+
+<main class="page">
+	<header class="bar">
+		<a class="brand" href="/">
+			<img src={icon} alt="" width="20" height="20" />
+			<span>write my app</span>
+		</a>
+		{#if fileList.length}
+			<span class="bar-stat">{fileList.length} {fileList.length === 1 ? 'spec' : 'specs'}</span>
+		{/if}
+	</header>
+
+	<div class="content">
+		<section class="composer-wrap">
+			<div class="composer">
+				<div class="composer-row">
+					<span class="prefix">›</span>
+					<textarea
+						bind:this={textareaEl}
+						bind:value={idea}
+						onkeydown={onKeydown}
+						placeholder="describe an app..."
+						rows="4"
+						disabled={loading}
+					></textarea>
+				</div>
+				<div class="composer-foot">
+					<div class="examples">
+						{#each examples as ex (ex)}
+							<button class="chip" onclick={() => useExample(ex)}>{ex}</button>
+						{/each}
+					</div>
+					<button class="primary" onclick={start} disabled={loading || !idea.trim()}>
+						{#if loading}
+							<span class="primary-loading">
+								<span class="pl-dot"></span>
+								<span>generating</span>
+							</span>
+						{:else}
+							<span>generate</span>
+							<span class="kbd-row"><kbd>⌘</kbd><kbd>↵</kbd></span>
+						{/if}
 					</button>
-					<button class="icon" title="Delete" onclick={() => deleteSession(s.id)}>×</button>
 				</div>
-			{/each}
-		</div>
-		<div class="brand">Write My App</div>
-	</aside>
-
-	<section class="chat">
-		<header class="chat-header">
-			<h2>{active?.title || 'New session'}</h2>
-		</header>
-
-		<div class="messages" bind:this={chatEl}>
-			{#if messages.length === 0}
-				<div class="empty">
-					<h3>Describe your app idea</h3>
-					<p>
-						Give me the seed of an idea — e.g. <em>"a recipe app that suggests meals based on
-						what's in my fridge"</em> — and I'll write a full build spec. Then iterate by chatting:
-						add features, narrow the audience, swap the stack.
-					</p>
-					<p class="muted">Backend defaults to Appwrite unless you say otherwise.</p>
-				</div>
-			{:else}
-				{#each messages as m, i (i)}
-					<div class="msg" class:user={m.role === 'user'} class:assistant={m.role === 'assistant'}>
-						<div class="role">{m.role}</div>
-						<div class="content">{m.content}</div>
-					</div>
-				{/each}
-				{#if loading}
-					<div class="msg assistant">
-						<div class="role">assistant</div>
-						<div class="content thinking">Writing spec…</div>
-					</div>
-				{/if}
-			{/if}
-			{#if errorMsg}
-				<div class="error">{errorMsg}</div>
-			{/if}
-		</div>
-
-		<div class="composer">
-			<textarea
-				placeholder="Describe your app or send feedback…"
-				bind:value={input}
-				onkeydown={onKeydown}
-				rows="3"
-				disabled={loading}
-			></textarea>
-			<button class="primary send" onclick={send} disabled={loading || !input.trim()}>
-				{loading ? '…' : 'Send'}
-			</button>
-		</div>
-	</section>
-
-	<section class="spec">
-		<header class="spec-header">
-			<h2>Specification</h2>
-			<div class="spec-actions">
-				<button onclick={copyMarkdown} disabled={!spec}>Copy MD</button>
-				<button class="primary" onclick={exportMarkdown} disabled={!spec}>Export .md</button>
 			</div>
-		</header>
-		<div class="spec-body">
-			{#if !spec}
-				<div class="empty">
-					<p class="muted">No spec yet. Send a message to generate one.</p>
+		</section>
+
+		<section class="reference">
+			<div class="ref-col">
+				<div class="ref-head">// what you get</div>
+				<ul class="tree">
+					<li><span class="tw-branch">└─</span><span class="tw-root">spec.md</span></li>
+					<li><span class="tw-branch">  ├─</span><span class="tw-key">overview</span></li>
+					<li><span class="tw-branch">  ├─</span><span class="tw-key">target users</span></li>
+					<li>
+						<span class="tw-branch">  ├─</span><span class="tw-key">features</span>
+						<span class="tw-meta">P0 · P1 · P2</span>
+					</li>
+					<li><span class="tw-branch">  ├─</span><span class="tw-key">user stories</span></li>
+					<li>
+						<span class="tw-branch">  ├─</span><span class="tw-key">design</span>
+						<span class="tw-meta">look · type · colors · screens</span>
+					</li>
+					<li>
+						<span class="tw-branch">  ├─</span><span class="tw-key">data model</span>
+						<span class="tw-meta">entities · fields · relations</span>
+					</li>
+					<li>
+						<span class="tw-branch">  ├─</span><span class="tw-key">api</span>
+						<span class="tw-meta">endpoints · req · res</span>
+					</li>
+					<li><span class="tw-branch">  ├─</span><span class="tw-key">tech stack</span></li>
+					<li><span class="tw-branch">  ├─</span><span class="tw-key">non-functional</span></li>
+					<li><span class="tw-branch">  └─</span><span class="tw-key">open questions</span></li>
+				</ul>
+			</div>
+
+			<div class="ref-col">
+				<div class="ref-head">// works with</div>
+				<div class="agent-pills">
+					<span class="agent">claude code</span>
+					<span class="agent">codex</span>
+					<span class="agent">cursor</span>
+					<span class="agent">copilot</span>
+					<span class="agent">opencode</span>
+					<span class="agent-etc">+ etc.</span>
 				</div>
-			{:else}
-				<h1 class="spec-title">{spec.title}</h1>
-				{#if spec.tagline}<blockquote>{spec.tagline}</blockquote>{/if}
-				{#if spec.overview}
-					<h3>Overview</h3>
-					<p>{spec.overview}</p>
-				{/if}
+				<div class="ref-foot">
+					<span class="rf-line">› iterate by chat to refine</span>
+					<span class="rf-line">› export as <code>.md</code> or <code>.json</code></span>
+					<span class="rf-line">› local-only, nothing leaves your browser</span>
+				</div>
+			</div>
+		</section>
 
-				{#if spec.target_audience?.length}
-					<h3>Target Audience</h3>
-					{#each spec.target_audience as a, i (i)}
-						<div class="block">
-							<strong>{a.persona}</strong>
-							<div><em>Needs:</em> {a.needs}</div>
-							<div><em>Pain points:</em> {a.pain_points}</div>
-						</div>
-					{/each}
-				{/if}
-
-				{#if spec.features?.length}
-					<h3>Features</h3>
-					{#each spec.features as f, i (i)}
-						<div class="block">
-							<strong>{f.name}</strong> <span class="priority p-{f.priority.toLowerCase()}">{f.priority}</span>
-							<div>{f.description}</div>
-							{#if f.user_value}<div class="muted"><em>Why:</em> {f.user_value}</div>{/if}
-						</div>
-					{/each}
-				{/if}
-
-				{#if spec.user_stories?.length}
-					<h3>User Stories</h3>
-					<ul>
-						{#each spec.user_stories as s, i (i)}
-							<li>{s}</li>
-						{/each}
-					</ul>
-				{/if}
-
-				{#if spec.design_spec}
-					<h3>Design</h3>
-					{#if spec.design_spec.look_and_feel}
-						<p><strong>Look & feel:</strong> {spec.design_spec.look_and_feel}</p>
+		{#if fileList.length}
+			<section class="files">
+				<div class="files-head">
+					<span class="fh-label">specs</span>
+					{#if fileList.length > 1}
+						<button
+							class="clear-all"
+							class:armed={clearAllPending}
+							data-clear-all
+							onclick={requestClearAll}
+						>
+							{clearAllPending ? 'sure?' : 'clear all'}
+						</button>
 					{/if}
-					{#if spec.design_spec.typography}
-						<p><strong>Typography:</strong> {spec.design_spec.typography}</p>
-					{/if}
-					{#if spec.design_spec.color_palette?.length}
-						<div class="palette">
-							{#each spec.design_spec.color_palette as c, i (i)}
-								<span class="swatch">{c}</span>
-							{/each}
-						</div>
-					{/if}
-					{#if spec.design_spec.key_screens?.length}
-						<h4>Key screens</h4>
-						{#each spec.design_spec.key_screens as scr, i (i)}
-							<div class="block">
-								<strong>{scr.name}</strong> — {scr.purpose}
-								{#if scr.components?.length}
-									<ul>
-										{#each scr.components as c, j (j)}<li>{c}</li>{/each}
-									</ul>
+				</div>
+				<ul class="files-list">
+					{#each fileList as s (s.id)}
+						{@const armed = pendingDeleteId === s.id}
+						<li class="file-row" class:armed>
+							<button class="file-open" onclick={() => openSession(s.id)}>
+								<span class="fr-title">{s.spec?.title || s.title || 'untitled'}</span>
+								<span class="fr-date">{rel(s.updatedAt)}</span>
+							</button>
+							<button
+								class="file-del"
+								class:armed
+								data-delete-btn
+								onclick={(e) => requestDelete(s.id, e)}
+								aria-label={armed ? 'confirm delete' : 'delete'}
+								title={armed ? 'click again' : 'delete'}
+							>
+								{#if armed}
+									<span>delete</span>
+								{:else}
+									<svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" aria-hidden="true">
+										<path d="M3 4h10M6.5 4V2.5h3V4M5 4l.5 9.5h5L11 4M7 6.5v5M9 6.5v5" stroke-linecap="round" stroke-linejoin="round"/>
+									</svg>
 								{/if}
-							</div>
-						{/each}
-					{/if}
-				{/if}
-
-				{#if spec.data_model?.length}
-					<h3>Data Model</h3>
-					{#each spec.data_model as e, i (i)}
-						<div class="block">
-							<strong>{e.entity}</strong>
-							{#if e.fields?.length}
-								<table>
-									<thead><tr><th>Field</th><th>Type</th><th>Notes</th></tr></thead>
-									<tbody>
-										{#each e.fields as f, j (j)}
-											<tr><td>{f.name}</td><td><code>{f.type}</code></td><td>{f.notes || ''}</td></tr>
-										{/each}
-									</tbody>
-								</table>
-							{/if}
-							{#if e.relationships}<div class="muted"><em>Relationships:</em> {e.relationships}</div>{/if}
-						</div>
+							</button>
+						</li>
 					{/each}
-				{/if}
-
-				{#if spec.api_schema?.length}
-					<h3>API</h3>
-					{#each spec.api_schema as r, i (i)}
-						<div class="block">
-							<code class="endpoint"><strong>{r.method}</strong> {r.path}</code>
-							<div>{r.purpose}</div>
-							{#if r.request_body}<div class="muted"><em>Request:</em> {r.request_body}</div>{/if}
-							{#if r.response_body}<div class="muted"><em>Response:</em> {r.response_body}</div>{/if}
-						</div>
-					{/each}
-				{/if}
-
-				{#if spec.tech_stack}
-					<h3>Recommended Stack</h3>
-					<ul>
-						<li><strong>Frontend:</strong> {spec.tech_stack.frontend}</li>
-						<li><strong>Backend:</strong> {spec.tech_stack.backend}</li>
-						<li><strong>Database:</strong> {spec.tech_stack.database}</li>
-						<li><strong>Auth:</strong> {spec.tech_stack.auth}</li>
-						<li><strong>Hosting:</strong> {spec.tech_stack.hosting}</li>
-					</ul>
-					{#if spec.tech_stack.notes}<p class="muted">{spec.tech_stack.notes}</p>{/if}
-				{/if}
-
-				{#if spec.non_functional_requirements?.length}
-					<h3>Non-functional</h3>
-					<ul>
-						{#each spec.non_functional_requirements as n, i (i)}<li>{n}</li>{/each}
-					</ul>
-				{/if}
-
-				{#if spec.open_questions?.length}
-					<h3>Open Questions</h3>
-					<ul>
-						{#each spec.open_questions as q, i (i)}<li>{q}</li>{/each}
-					</ul>
-				{/if}
-			{/if}
-		</div>
-	</section>
-</div>
+				</ul>
+			</section>
+		{/if}
+	</div>
+</main>
 
 <style>
-	:global(html, body) {
-		height: 100%;
-		margin: 0;
-		font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
-		background: #0b0d11;
-		color: #e6e7ea;
-	}
-	:global(*) { box-sizing: border-box; }
-
-	.app {
-		display: grid;
-		grid-template-columns: 240px 1fr 1fr;
-		height: 100vh;
-		min-height: 0;
-	}
-
-	.sidebar {
-		background: #0f1218;
-		border-right: 1px solid #1f2530;
+	.page {
+		min-height: 100vh;
 		display: flex;
 		flex-direction: column;
-		padding: 14px;
-		gap: 10px;
-		min-height: 0;
 	}
-	.brand {
-		margin-top: auto;
-		font-size: 11px;
-		color: #6b7280;
-		letter-spacing: 0.08em;
-		text-transform: uppercase;
-	}
-	.session-list {
-		flex: 1;
-		overflow-y: auto;
-		display: flex;
-		flex-direction: column;
-		gap: 4px;
-	}
-	.session-row {
-		display: flex;
-		gap: 4px;
-		align-items: stretch;
-	}
-	.session-row.active .session-pick {
-		background: #1a2230;
-		border-color: #2a3344;
-	}
-	.session-pick {
-		flex: 1;
-		text-align: left;
-		background: transparent;
-		border: 1px solid transparent;
-		color: inherit;
-		padding: 8px 10px;
-		border-radius: 8px;
-		cursor: pointer;
-	}
-	.session-pick:hover { background: #141923; }
-	.session-title {
-		font-size: 13px;
-		font-weight: 500;
-		white-space: nowrap;
-		overflow: hidden;
-		text-overflow: ellipsis;
-	}
-	.session-sub {
-		font-size: 11px;
-		color: #6b7280;
-		margin-top: 2px;
-	}
-	.icon {
-		background: transparent;
-		color: #6b7280;
-		border: none;
-		font-size: 18px;
-		line-height: 1;
-		padding: 4px 8px;
-		cursor: pointer;
-		border-radius: 6px;
-	}
-	.icon:hover { background: #1a2230; color: #e6e7ea; }
 
-	.chat {
-		display: flex;
-		flex-direction: column;
-		min-height: 0;
-		border-right: 1px solid #1f2530;
-	}
-	.chat-header, .spec-header {
-		padding: 12px 18px;
-		border-bottom: 1px solid #1f2530;
+	/* ---------- Top bar ---------- */
+	.bar {
 		display: flex;
 		align-items: center;
 		justify-content: space-between;
+		padding: 14px 22px;
+		border-bottom: 1px solid var(--rule);
+		gap: 16px;
+		flex-shrink: 0;
 	}
-	.chat-header h2, .spec-header h2 {
-		margin: 0;
-		font-size: 14px;
+	.brand {
+		display: inline-flex;
+		align-items: center;
+		gap: 10px;
+		font-family: var(--font-mono);
 		font-weight: 600;
-		color: #9aa3b2;
+		font-size: 13px;
+		color: var(--text);
+		text-decoration: none;
+		letter-spacing: -0.005em;
 	}
-	.spec-actions { display: flex; gap: 8px; }
+	.brand img {
+		border-radius: 4px;
+		display: block;
+	}
+	.bar-stat {
+		font-family: var(--font-mono);
+		font-size: 11px;
+		color: var(--text-dim);
+	}
 
-	.messages {
+	/* ---------- Content ---------- */
+	.content {
 		flex: 1;
-		overflow-y: auto;
-		padding: 18px;
+		max-width: 820px;
+		width: 100%;
+		margin: 0 auto;
+		padding: clamp(20px, 4vh, 40px) 22px 56px;
 		display: flex;
 		flex-direction: column;
-		gap: 14px;
+		gap: 28px;
 	}
-	.msg {
+
+	/* ---------- Composer ---------- */
+	.composer {
+		background: var(--bg-1);
+		border: 1px solid var(--rule);
+		border-radius: 5px;
+		transition: border-color 0.12s ease, box-shadow 0.12s ease;
+	}
+	.composer:focus-within {
+		border-color: var(--mark);
+		box-shadow: 0 0 0 3px var(--mark-soft);
+	}
+	.composer-row {
+		display: flex;
+		gap: 12px;
+		padding: 18px 18px 10px;
+	}
+	.prefix {
+		color: var(--mark);
+		font-family: var(--font-mono);
+		font-size: 22px;
+		line-height: 1.4;
+		flex-shrink: 0;
+		font-weight: 600;
+		user-select: none;
+		padding-top: 0;
+	}
+	textarea {
+		width: 100%;
+		background: transparent;
+		color: var(--text);
+		border: none;
+		outline: none;
+		resize: none;
+		font-family: var(--font-mono);
+		font-size: 17px;
+		line-height: 1.5;
+		min-height: 140px;
+		field-sizing: content;
+	}
+	textarea::placeholder {
+		color: var(--text-dim);
+	}
+
+	.composer-foot {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 12px;
+		padding: 10px 14px 12px;
+		border-top: 1px solid var(--rule-soft);
+	}
+	.examples {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 5px;
+		flex: 1;
+		min-width: 0;
+	}
+	.chip {
+		background: transparent;
+		color: var(--text-muted);
+		border: 1px solid var(--rule);
+		padding: 4px 10px;
+		font-family: var(--font-mono);
+		font-size: 12px;
+		border-radius: 3px;
+		cursor: pointer;
+		max-width: 100%;
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		transition: color 0.12s ease, border-color 0.12s ease;
+	}
+	.chip:hover {
+		color: var(--text);
+		border-color: var(--rule-strong);
+	}
+
+	.primary {
+		display: inline-flex;
+		align-items: center;
+		gap: 10px;
+		background: var(--mark);
+		color: var(--bg);
+		border: 1px solid var(--mark);
+		padding: 8px 14px;
+		font-family: var(--font-mono);
+		font-size: 13px;
+		font-weight: 600;
+		border-radius: 3px;
+		cursor: pointer;
+		transition: background 0.12s ease, transform 0.05s ease;
+		flex-shrink: 0;
+	}
+	.primary:hover:not(:disabled) {
+		background: var(--mark-bright);
+	}
+	.primary:active:not(:disabled) {
+		transform: translateY(1px);
+	}
+	.primary:disabled {
+		opacity: 0.35;
+		cursor: not-allowed;
+	}
+	.kbd-row {
+		display: inline-flex;
+		gap: 2px;
+		opacity: 0.65;
+	}
+
+	.primary-loading {
+		display: inline-flex;
+		align-items: center;
+		gap: 8px;
+	}
+	.pl-dot {
+		width: 7px;
+		height: 7px;
+		border-radius: 999px;
+		background: var(--bg);
+		display: inline-block;
+		animation: pl-pulse 1.3s ease-in-out infinite;
+	}
+	@keyframes pl-pulse {
+		0%, 100% { opacity: 0.4; transform: scale(0.85); }
+		50%      { opacity: 1;   transform: scale(1); }
+	}
+
+	kbd {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		font-family: var(--font-mono);
+		background: var(--bg-2);
+		border: 1px solid var(--rule);
+		border-radius: 3px;
+		padding: 0 5px;
+		min-width: 16px;
+		height: 16px;
+		font-size: 10.5px;
+		color: var(--text-muted);
+	}
+	.primary kbd {
+		background: rgba(0, 0, 0, 0.18);
+		border-color: rgba(0, 0, 0, 0.18);
+		color: rgba(0, 0, 0, 0.65);
+	}
+
+	/* ---------- Reference (what you get / works with) ---------- */
+	.reference {
+		display: grid;
+		grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+		gap: 32px;
+		padding-top: 4px;
+	}
+	.ref-col {
+		display: flex;
+		flex-direction: column;
+		gap: 12px;
+		min-width: 0;
+	}
+	.ref-head {
+		font-family: var(--font-mono);
+		font-size: 11.5px;
+		color: var(--text-muted);
+		letter-spacing: 0.02em;
+		padding-bottom: 8px;
+		border-bottom: 1px solid var(--rule-soft);
+	}
+
+	/* file tree */
+	.tree {
+		list-style: none;
+		margin: 0;
+		padding: 0;
+		font-family: var(--font-mono);
+		font-size: 12.5px;
+		line-height: 1.7;
+		color: var(--text-soft);
+	}
+	.tree li {
+		display: flex;
+		align-items: baseline;
+		gap: 8px;
+		white-space: nowrap;
+		overflow: hidden;
+	}
+	.tw-branch {
+		color: var(--text-dim);
+		white-space: pre;
+		flex-shrink: 0;
+	}
+	.tw-root {
+		color: var(--mark);
+		font-weight: 600;
+	}
+	.tw-key {
+		color: var(--text);
+		flex-shrink: 0;
+	}
+	.tw-meta {
+		color: var(--text-dim);
+		font-size: 11.5px;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		min-width: 0;
+	}
+
+	/* agent pills */
+	.agent-pills {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 5px;
+	}
+	.agent {
+		display: inline-flex;
+		align-items: center;
+		font-family: var(--font-mono);
+		font-size: 12px;
+		color: var(--text-soft);
+		background: var(--bg-1);
+		border: 1px solid var(--rule);
+		padding: 3px 9px;
+		border-radius: 3px;
+	}
+	.agent-etc {
+		display: inline-flex;
+		align-items: center;
+		font-family: var(--font-mono);
+		font-size: 12px;
+		color: var(--text-dim);
+		padding: 3px 4px;
+	}
+
+	.ref-foot {
 		display: flex;
 		flex-direction: column;
 		gap: 4px;
+		margin-top: 14px;
+		padding-top: 12px;
+		border-top: 1px dashed var(--rule-soft);
 	}
-	.msg .role {
-		font-size: 10px;
-		color: #6b7280;
-		text-transform: uppercase;
-		letter-spacing: 0.08em;
-	}
-	.msg .content {
-		white-space: pre-wrap;
+	.rf-line {
+		font-family: var(--font-mono);
+		font-size: 11.5px;
+		color: var(--text-muted);
 		line-height: 1.55;
-		font-size: 14px;
-		background: #141923;
-		border: 1px solid #1f2530;
-		padding: 10px 12px;
-		border-radius: 10px;
-		max-width: 60ch;
 	}
-	.msg.user .content {
-		background: #1a2230;
-		border-color: #2a3344;
-		align-self: flex-end;
-	}
-	.msg.user { align-items: flex-end; }
-	.thinking { color: #9aa3b2; font-style: italic; }
-	.error {
-		background: #2a1414;
-		color: #ffb4b4;
-		border: 1px solid #5a1f1f;
-		padding: 10px 12px;
-		border-radius: 8px;
-		font-size: 13px;
+	.rf-line code {
+		font-family: var(--font-mono);
+		color: var(--mark);
+		background: var(--bg-1);
+		padding: 0 4px;
+		border-radius: 2px;
+		border: 1px solid var(--rule);
+		font-size: 11px;
 	}
 
-	.composer {
+	@media (max-width: 640px) {
+		.reference {
+			grid-template-columns: 1fr;
+			gap: 24px;
+		}
+	}
+
+	/* ---------- Files ---------- */
+	.files-head {
 		display: flex;
-		gap: 8px;
-		padding: 12px;
-		border-top: 1px solid #1f2530;
-		background: #0f1218;
+		align-items: center;
+		justify-content: space-between;
+		padding-bottom: 10px;
+		border-bottom: 1px solid var(--rule);
 	}
-	.composer textarea {
-		flex: 1;
-		resize: none;
-		background: #141923;
-		color: inherit;
-		border: 1px solid #1f2530;
-		border-radius: 8px;
-		padding: 10px 12px;
-		font: inherit;
-		font-size: 14px;
-		outline: none;
+	.fh-label {
+		font-family: var(--font-mono);
+		font-size: 11px;
+		color: var(--text-muted);
+		text-transform: lowercase;
+		letter-spacing: 0.04em;
 	}
-	.composer textarea:focus { border-color: #3b82f6; }
+	.clear-all {
+		background: transparent;
+		color: var(--text-dim);
+		border: 1px solid transparent;
+		padding: 2px 8px;
+		font-family: var(--font-mono);
+		font-size: 11px;
+		border-radius: 3px;
+		cursor: pointer;
+		transition: color 0.12s ease, border-color 0.12s ease, background 0.12s ease;
+	}
+	.clear-all:hover {
+		color: var(--err);
+	}
+	.clear-all.armed {
+		color: var(--bg);
+		background: var(--err);
+		border-color: var(--err);
+	}
 
-	button.primary {
-		background: #3b82f6;
-		color: white;
+	.files-list {
+		list-style: none;
+		padding: 0;
+		margin: 0;
+		display: flex;
+		flex-direction: column;
+	}
+	.file-row {
+		display: grid;
+		grid-template-columns: minmax(0, 1fr) 32px;
+		border-bottom: 1px solid var(--rule-soft);
+		transition: background 0.1s ease;
+	}
+	.file-row:hover {
+		background: var(--bg-1);
+	}
+	.file-row.armed {
+		background: rgba(232, 112, 76, 0.06);
+	}
+	.file-open {
+		display: grid;
+		grid-template-columns: minmax(0, 1fr) auto;
+		gap: 16px;
+		align-items: center;
+		background: transparent;
 		border: none;
-		border-radius: 8px;
-		padding: 8px 14px;
-		font-weight: 600;
-		cursor: pointer;
-	}
-	button.primary:hover { background: #2563eb; }
-	button.primary:disabled { background: #1f2937; color: #6b7280; cursor: not-allowed; }
-	button:not(.primary):not(.icon):not(.session-pick) {
-		background: #141923;
-		color: inherit;
-		border: 1px solid #1f2530;
-		border-radius: 8px;
-		padding: 6px 12px;
-		font-size: 13px;
-		cursor: pointer;
-	}
-	button:not(.primary):not(.icon):not(.session-pick):hover { background: #1a2230; }
-	button:disabled { opacity: 0.5; cursor: not-allowed; }
-	.send { align-self: flex-end; }
-
-	.spec { display: flex; flex-direction: column; min-height: 0; }
-	.spec-body {
-		flex: 1;
-		overflow-y: auto;
-		padding: 18px 22px;
-		line-height: 1.55;
-		font-size: 14px;
-	}
-	.spec-title { margin: 0 0 6px; font-size: 22px; }
-	.spec blockquote {
-		border-left: 3px solid #3b82f6;
-		margin: 0 0 16px;
-		padding: 4px 12px;
-		color: #9aa3b2;
-		font-style: italic;
-	}
-	.spec h3 {
-		margin: 22px 0 8px;
-		font-size: 13px;
-		text-transform: uppercase;
-		letter-spacing: 0.08em;
-		color: #9aa3b2;
-	}
-	.spec h4 { margin: 14px 0 6px; font-size: 13px; color: #cbd2db; }
-	.block {
-		background: #11151c;
-		border: 1px solid #1f2530;
-		padding: 10px 12px;
-		border-radius: 8px;
-		margin-bottom: 8px;
-	}
-	.priority {
-		font-size: 10px;
-		padding: 1px 6px;
-		border-radius: 4px;
-		margin-left: 6px;
-		vertical-align: middle;
-	}
-	.p-p0 { background: #5b1e1e; color: #ffb4b4; }
-	.p-p1 { background: #1e3a5b; color: #b4d4ff; }
-	.p-p2 { background: #1f2530; color: #9aa3b2; }
-	.endpoint { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
-	.muted { color: #9aa3b2; font-size: 13px; }
-	.empty {
-		color: #9aa3b2;
-		max-width: 56ch;
-	}
-	.empty h3 { color: #e6e7ea; }
-	.palette { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
-	.swatch {
-		background: #11151c;
-		border: 1px solid #1f2530;
-		padding: 4px 8px;
-		border-radius: 6px;
-		font-size: 12px;
-		font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-	}
-	table {
-		width: 100%;
-		border-collapse: collapse;
-		font-size: 13px;
-		margin-top: 6px;
-	}
-	th, td {
+		padding: 11px 10px;
 		text-align: left;
-		padding: 6px 8px;
-		border-bottom: 1px solid #1f2530;
+		cursor: pointer;
+		color: var(--text);
+		min-width: 0;
 	}
-	th { color: #9aa3b2; font-weight: 500; font-size: 12px; }
-	code {
-		font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-		font-size: 12px;
-		background: #1f2530;
-		padding: 1px 5px;
-		border-radius: 4px;
+	.fr-title {
+		font-family: var(--font-sans);
+		font-size: 14px;
+		color: var(--text);
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		min-width: 0;
+	}
+	.file-row:hover .fr-title {
+		color: var(--mark-bright);
+	}
+	.fr-date {
+		font-family: var(--font-mono);
+		font-size: 11px;
+		color: var(--text-dim);
 	}
 
-	@media (max-width: 1100px) {
-		.app { grid-template-columns: 200px 1fr 1fr; }
+	.file-del {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		background: transparent;
+		border: none;
+		color: var(--text-dim);
+		cursor: pointer;
+		font-family: var(--font-mono);
+		font-size: 11px;
+		padding: 0 8px;
+		transition: color 0.12s ease, background 0.12s ease;
 	}
-	@media (max-width: 900px) {
-		.app { grid-template-columns: 1fr; grid-template-rows: auto auto auto; height: auto; }
-		.chat, .spec, .sidebar { height: auto; }
-		.messages, .spec-body { max-height: 60vh; }
+	.file-del:hover {
+		color: var(--err);
+	}
+	.file-del.armed {
+		color: var(--bg);
+		background: var(--err);
+		min-width: 60px;
+	}
+	.file-del.armed span {
+		font-weight: 600;
+	}
+
+	@media (max-width: 640px) {
+		.bar {
+			padding: 12px 14px;
+		}
+		.content {
+			padding: clamp(28px, 6vh, 48px) 14px 48px;
+			gap: 32px;
+		}
+		textarea {
+			font-size: 16px; /* prevent iOS auto-zoom on focus */
+			line-height: 1.5;
+		}
+		.composer-row {
+			padding: 12px 12px 6px;
+		}
+		.composer-foot {
+			flex-direction: column-reverse;
+			align-items: stretch;
+			gap: 10px;
+			padding: 8px 10px 10px;
+		}
+		.primary {
+			width: 100%;
+			justify-content: center;
+			padding: 9px 14px;
+		}
+		.chip {
+			padding: 4px 9px;
+		}
+		.file-open {
+			padding: 12px 8px;
+			gap: 10px;
+		}
+		.fr-title {
+			font-size: 14.5px;
+		}
+		.file-del {
+			min-width: 38px;
+		}
+		.file-del.armed {
+			min-width: 68px;
+		}
 	}
 </style>

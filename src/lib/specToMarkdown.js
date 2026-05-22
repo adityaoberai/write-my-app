@@ -54,7 +54,7 @@ export function specToMarkdown(spec) {
 		if (d.key_screens?.length) {
 			lines.push('### Key screens');
 			for (const s of d.key_screens) {
-				lines.push(`- **${s.name}** — ${s.purpose}`);
+				lines.push(`- **${s.name}**: ${s.purpose}`);
 				if (s.components?.length) {
 					for (const c of s.components) lines.push(`  - ${c}`);
 				}

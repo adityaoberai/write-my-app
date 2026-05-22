@@ -22,7 +22,7 @@ export function saveState(state) {
 	try {
 		localStorage.setItem(KEY, JSON.stringify(state));
 	} catch {
-		// quota or serialization failure — silently ignore
+		// quota or serialization failure: silently ignore
 	}
 }
 
