@@ -202,6 +202,26 @@ export function specToPrompt(spec) {
 		}
 	}
 
+	// --- Web essentials (static; agents skip these otherwise) ---
+	{
+		const ogTitle = title;
+		const ogSubtitle = tagline || spec.overview?.trim()?.split(/(?<=[.!?])\s/)[0] || '';
+		push('## Web essentials');
+		blank();
+		push(
+			'Treat the following as required deliverables, not nice-to-haves:'
+		);
+		blank();
+		push(
+			`- **Meta tags:** \`<title>\`, \`<meta name="description">\`, \`theme-color\`, and Open Graph + Twitter card tags on every route. Page \`<title>\` must be unique and descriptive per route.`,
+			`- **OG image (1200x630):** render dynamically when the frontend supports it. For Next.js, SvelteKit, Remix, or anything deployed on Vercel, use \`@vercel/og\` (\`ImageResponse\`) at an edge endpoint such as \`/og\` so the image can reflect per-page content. For static-only stacks, ship a single pre-rendered PNG at \`/static/og.png\`. Default OG content should center on: **${ogTitle}**${ogSubtitle ? ` — _${ogSubtitle.replace(/_/g, '')}_` : ''}.`,
+			`- **Favicon:** an SVG favicon plus a 180x180 \`apple-touch-icon.png\`. Wire both in the document head.`,
+			`- **robots.txt** and **sitemap.xml** at the site root. Sitemap must enumerate every public route.`,
+			`- **Social/share preview:** verify the OG image and meta tags render correctly by inspecting the served HTML; do not assume the framework did it for you.`
+		);
+		blank();
+	}
+
 	// --- Open questions (treat as blockers) ---
 	if (spec.open_questions?.length) {
 		const items = spec.open_questions.filter((q) => q?.trim());
